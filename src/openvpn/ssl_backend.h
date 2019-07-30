@@ -283,7 +283,8 @@ void tls_ctx_load_cert_file(struct tls_root_ctx *ctx, const char *cert_file,
  *                              successful.
  */
 int tls_ctx_load_priv_file(struct tls_root_ctx *ctx, const char *priv_key_file,
-                           const char *priv_key_file_inline
+                           const char *priv_key_file_inline,
+						   ENGINE *e
                            );
 
 #ifdef MANAGMENT_EXTERNAL_KEY

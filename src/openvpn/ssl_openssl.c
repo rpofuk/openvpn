@@ -16,7 +16,7 @@
  *  but WITHOUT ANY WARRANTY; without even the implied warranty of
  *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  *  GNU General Public License for more details.
- *
+ *# include <openssl/engine.h>
  *  You should have received a copy of the GNU General Public License along
  *  with this program; if not, write to the Free Software Foundation, Inc.,
  *  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
@@ -56,6 +56,8 @@
 #include <openssl/pkcs12.h>
 #include <openssl/x509.h>
 #include <openssl/crypto.h>
+#include <openssl/engine.h>
+#include <openssl/ui.h>
 #ifndef OPENSSL_NO_EC
 #include <openssl/ec.h>
 #endif
@@ -114,7 +116,16 @@ tls_ctx_client_new(struct tls_root_ctx *ctx)
 {
     ASSERT(NULL != ctx);
 
-    ctx->ctx = SSL_CTX_new(SSLv23_client_method());
+    crypto_msg(M_INFO, "Creating new client");
+
+    const SSL_METHOD *method = SSLv23_client_method();
+
+    crypto_msg(M_INFO, "Storing client");
+
+    ctx->ctx = SSL_CTX_new(method);
+
+    crypto_msg(M_INFO, "Creating new client");
+
 
     if (ctx->ctx == NULL)
     {
@@ -935,9 +946,132 @@ tls_ctx_load_cert_file(struct tls_root_ctx *ctx, const char *cert_file,
     tls_ctx_load_cert_file_and_copy(ctx, cert_file, cert_file_inline, NULL);
 }
 
+typedef struct pw_cb_data {
+    const void *password;
+    const char *prompt_info;
+} PW_CB_DATA;
+
+
+static ENGINE *try_load_engine(const char *engine)
+{
+    ENGINE *e = ENGINE_by_id("dynamic");
+    if (e) {
+        if (!ENGINE_ctrl_cmd_string(e, "SO_PATH", engine, 0)
+            || !ENGINE_ctrl_cmd_string(e, "LOAD", NULL, 0)) {
+            ENGINE_free(e);
+            e = NULL;
+        }
+    }
+    return e;
+}
+
+static const UI_METHOD *ui_fallback_method = NULL;
+
+static int ui_open(UI *ui)
+{
+    int (*opener)(UI *ui) = UI_method_get_opener(ui_fallback_method);
+
+    if (opener)
+        return opener(ui);
+    return 1;
+}
+
+static int ui_read(UI *ui, UI_STRING *uis)
+{
+    int (*reader)(UI *ui, UI_STRING *uis) = NULL;
+
+    if (UI_get_input_flags(uis) & UI_INPUT_FLAG_DEFAULT_PWD
+        && UI_get0_user_data(ui)) {
+        switch (UI_get_string_type(uis)) {
+        case UIT_PROMPT:
+        case UIT_VERIFY:
+            {
+                const char *password =
+                    ((PW_CB_DATA *)UI_get0_user_data(ui))->password;
+                if (password && password[0] != '\0') {
+                    UI_set_result(ui, uis, password);
+                    return 1;
+                }
+            }
+            break;
+        case UIT_NONE:
+        case UIT_BOOLEAN:
+        case UIT_INFO:
+        case UIT_ERROR:
+            break;
+        }
+    }
+
+    reader = UI_method_get_reader(ui_fallback_method);
+    if (reader)
+        return reader(ui, uis);
+    return 1;
+}
+
+static int ui_write(UI *ui, UI_STRING *uis)
+{
+    int (*writer)(UI *ui, UI_STRING *uis) = NULL;
+
+    if (UI_get_input_flags(uis) & UI_INPUT_FLAG_DEFAULT_PWD
+        && UI_get0_user_data(ui)) {
+        switch (UI_get_string_type(uis)) {
+        case UIT_PROMPT:
+        case UIT_VERIFY:
+            {
+                const char *password =
+                    ((PW_CB_DATA *)UI_get0_user_data(ui))->password;
+                if (password && password[0] != '\0')
+                    return 1;
+            }
+            break;
+        case UIT_NONE:
+        case UIT_BOOLEAN:
+        case UIT_INFO:
+        case UIT_ERROR:
+            break;
+        }
+    }
+
+    writer = UI_method_get_writer(ui_fallback_method);
+    if (writer)
+        return writer(ui, uis);
+    return 1;
+}
+
+static int ui_close(UI *ui)
+{
+    int (*closer)(UI *ui) = UI_method_get_closer(ui_fallback_method);
+
+    if (closer)
+        return closer(ui);
+    return 1;
+}
+
+UI_METHOD* setup_ui_method(void)
+{
+    ui_fallback_method = UI_null();
+#ifndef OPENSSL_NO_UI_CONSOLE
+    ui_fallback_method = UI_OpenSSL();
+#endif
+    static UI_METHOD *ui_method = NULL;
+    ui_method = UI_create_method("OpenSSL application user interface");
+    UI_method_set_opener(ui_method, ui_open);
+    UI_method_set_reader(ui_method, ui_read);
+    UI_method_set_writer(ui_method, ui_write);
+    UI_method_set_closer(ui_method, ui_close);
+    return ui_method;
+}
+
+
+const UI_METHOD *get_ui_method(void)
+{
+    return setup_ui_method();
+}
+
 int
 tls_ctx_load_priv_file(struct tls_root_ctx *ctx, const char *priv_key_file,
-                       const char *priv_key_file_inline
+                       const char *priv_key_file_inline,
+					   ENGINE *en
                        )
 {
     SSL_CTX *ssl_ctx = NULL;
@@ -963,13 +1097,58 @@ tls_ctx_load_priv_file(struct tls_root_ctx *ctx, const char *priv_key_file,
         goto end;
     }
 
-    pkey = PEM_read_bio_PrivateKey(in, NULL,
-                                   SSL_CTX_get_default_passwd_cb(ctx->ctx),
-                                   SSL_CTX_get_default_passwd_cb_userdata(ctx->ctx));
+    msg(M_INFO, "Reading private !!");
+
+    PW_CB_DATA cb_data;
+
+
+
+	cb_data.password = SSL_CTX_get_default_passwd_cb(ctx->ctx);
+    cb_data.prompt_info = SSL_CTX_get_default_passwd_cb_userdata(ctx->ctx);
+
+    msg(M_INFO, "Loading engine");
+
+    ENGINE *e;
+    const char *engine = "libtpm2tss";
+    if ((e = ENGINE_by_id(engine)) == NULL
+        && (e = try_load_engine(engine)) == NULL) {
+        msg(M_ERR, "Unable to load engine");
+        return 0;
+    }
+    ENGINE_ctrl(e, ENGINE_CTRL_SET_LOGSTREAM, 0, stdout, 0);
+    msg(M_INFO, "Engine loaded");
+    ENGINE_ctrl_cmd(e, "SET_USER_INTERFACE", 0, (void *)get_ui_method(), 0, 1);
+
+    if (!ENGINE_set_default(e, ENGINE_METHOD_ALL)) {
+        msg(M_ERR, "Can't use that engine");
+        return 0;
+    }
+
+    msg(M_INFO, "Initializing engine");
+    ENGINE_init(e);
+    if (!ENGINE_init(e)) {
+        msg(M_ERR, "Unable to initialize engine");
+
+    }
+    msg(M_INFO, "Loading key %s", priv_key_file);
+
+
+    pkey = ENGINE_load_private_key(e, priv_key_file,
+    								(UI_METHOD *)get_ui_method(),
+										&cb_data
+                                   );
+    msg(M_INFO, "Done reading private");
+
+    ENGINE_finish(e);
+
     if (!pkey)
     {
+        msg(M_INFO, "Private key not valid");
         goto end;
     }
+
+    msg(M_INFO, "User private key");
+
 
     if (!SSL_CTX_use_PrivateKey(ssl_ctx, pkey))
     {
@@ -982,6 +1161,7 @@ tls_ctx_load_priv_file(struct tls_root_ctx *ctx, const char *priv_key_file,
         crypto_msg(M_WARN, "Cannot load private key file %s", priv_key_file);
         goto end;
     }
+    msg(M_INFO, "Starting private key check");
 
     /* Check Private Key */
     if (!SSL_CTX_check_private_key(ssl_ctx))

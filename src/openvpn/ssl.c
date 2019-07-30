@@ -609,6 +609,9 @@ init_ssl(const struct options *options, struct tls_root_ctx *new_ctx)
 
     tls_clear_error();
 
+    msg(M_WARN, "Preparing SSL %s",
+                        options->engine);
+
     if (options->tls_server)
     {
         tls_ctx_server_new(new_ctx);
@@ -621,8 +624,10 @@ init_ssl(const struct options *options, struct tls_root_ctx *new_ctx)
     }
     else                        /* if client */
     {
+    	msg(M_WARN, "Setting up client");
         tls_ctx_client_new(new_ctx);
     }
+    msg(M_WARN, "SSL Ready");
 
     /* Restrict allowed certificate crypto algorithms */
     tls_ctx_set_cert_profile(new_ctx, options->tls_cert_profile);
@@ -637,6 +642,9 @@ init_ssl(const struct options *options, struct tls_root_ctx *new_ctx)
     {
         goto err;
     }
+
+
+
 
     if (options->pkcs12_file)
     {
@@ -693,7 +701,11 @@ init_ssl(const struct options *options, struct tls_root_ctx *new_ctx)
         /* Load Private Key */
         if (options->priv_key_file)
         {
-            if (0 != tls_ctx_load_priv_file(new_ctx, options->priv_key_file, options->priv_key_file_inline))
+            if (0 != tls_ctx_load_priv_file(new_ctx,
+            		options->priv_key_file,
+					options->priv_key_file_inline,
+					NULL
+					))
             {
                 goto err;
             }
